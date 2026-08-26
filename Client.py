@@ -1,68 +1,81 @@
+import Modules.protocol as protocol
 import socket
 import threading
+import queue
+import time
 
-# 1. A list to keep track of all connected client sockets
-active_clients = []
+class NetworkManager:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.message_queue = queue.Queue()
+        self.is_connected = False
 
-def broadcast(message, sender_socket):
-    """Routes an incoming message to all other connected clients."""
-    for client in active_clients:
-        # Don't echo the message back to the person who sent it
-        if client != sender_socket:
-            try:
-                client.send(message.encode('utf-8'))
-            except Exception:
-                # If sending fails, the client disconnected unexpectedly
-                remove_client(client)
-
-def remove_client(client_socket):
-    """Safely removes a disconnected client from the active list."""
-    if client_socket in active_clients:
-        active_clients.remove(client_socket)
-        client_socket.close()
-
-def handle_client(client_socket, client_address):
-    """Handles continuous listening for a single client."""
-    print(f"\n[JOINED] {client_address} connected.")
-    active_clients.append(client_socket)
-    
-    # Announce new user to everyone else
-    broadcast(f"User {client_address[1]} has joined the chat.", client_socket)
-    
-    while True:
+    def connect(self):
         try:
-            message = client_socket.recv(1024).decode('utf-8')
-            if not message:
+            self.client_socket.connect((self.host, self.port))
+            self.is_connected = True
+            threading.Thread(target=self._listen_for_data, daemon=True).start()
+            return True
+        except ConnectionRefusedError:
+            return False
+
+    def _listen_for_data(self):
+        """Continuously reads framed messages and queues the parsed dictionaries."""
+        while self.is_connected:
+            packet_type, payload = protocol.receive_message(self.client_socket)
+            
+            if packet_type is None:
+                self.disconnect()
                 break
                 
-            # 2. When a message is received, broadcast it to the group
-            formatted_msg = f"User {client_address[1]}: {message}"
-            print(f"[LOG] {formatted_msg}")
-            broadcast(formatted_msg, client_socket)
-            
-        except ConnectionResetError:
-            break
-            
-    print(f"\n[LEFT] {client_address} disconnected.")
-    remove_client(client_socket)
-    broadcast(f"User {client_address[1]} has left the chat.", client_socket)
+            # Place both the type and the dictionary into the queue
+            self.message_queue.put((packet_type, payload))
 
-def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(('127.0.0.1', 5000))
-    server_socket.listen()
-    print("[STARTING] Multi-User Server is listening on 127.0.0.1:5000...")
+    def send_chat(self, text_content):
+        """Packages text into a dictionary and sends it via the protocol."""
+        if self.is_connected:
+            payload = {"content": text_content}
+            protocol.send_message(self.client_socket, protocol.TYPE_CHAT, payload)
 
-    while True:
-        client_socket, client_address = server_socket.accept()
-        
-        # Spawn thread for the new user
-        thread = threading.Thread(
-            target=handle_client, 
-            args=(client_socket, client_address),
-            daemon=True
-        )
-        thread.start()
+    def get_message(self):
+        if not self.message_queue.empty():
+            return self.message_queue.get()
+        return None
+
+    def disconnect(self):
+        self.is_connected = False
+        self.client_socket.close()
+
+# --- Application UI Simulation ---
+def ui_event_loop(network):
+    while network.is_connected:
+        msg_data = network.get_message()
+        if msg_data:
+            packet_type, payload = msg_data
+            
+            if packet_type == protocol.TYPE_CHAT:
+                sender = payload.get("sender", "Unknown")
+                content = payload.get("content", "")
+                print(f"\n[{sender}]: {content}\nType your message: ", end="")
+                
+        time.sleep(0.1)
 
 if __name__ == "__main__":
-    start_server()
+    net = NetworkManager('127.0.0.1', 5000)
+    
+    if net.connect():
+        print("Connected to Server! (Type 'exit' to quit)\n")
+        threading.Thread(target=ui_event_loop, args=(net,), daemon=True).start()
+        
+        while True:
+            user_input = input("Type your message: ")
+            if user_input.lower() == 'exit':
+                break
+            if user_input:
+                net.send_chat(user_input)
+                
+        net.disconnect()
+    else:
+        print("Failed to connect to the server.")
