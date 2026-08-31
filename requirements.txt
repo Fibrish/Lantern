@@ -1,0 +1,2 @@
+zeroconf>=0.131.0
+customtkinter>=5.2.2

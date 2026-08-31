@@ -8,8 +8,11 @@ MAX_PAYLOAD_SIZE = 10 * 1024 * 1024  # 10 MB limit to prevent memory overload
 # --- Packet Types ---
 TYPE_LOGIN = 1
 TYPE_CHAT = 2
-TYPE_FILE_META = 3
-TYPE_FILE_CHUNK = 4
+TYPE_AUTH_INIT = 5       # Client -> Server: "I want to connect"
+TYPE_AUTH_CHALLENGE = 6  # Server -> Client: "Sign this random nonce"
+TYPE_AUTH_RESPONSE = 7   # Client -> Server: "Here is my signature and public key"
+TYPE_AUTH_ERROR = 8      # Server -> Client: "Authentication failed"
+TYPE_AUTH_SUCCESS = 9    # Server -> Client: "Authentication passed, ready for data"
 
 # Header: 1 Byte (Version) + 1 Byte (Type) + 4 Bytes (Payload Size) = 6 Bytes total
 HEADER_FORMAT = '!BBI'
