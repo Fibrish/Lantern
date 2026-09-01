@@ -1,215 +1,231 @@
-import os
-import socket
-import threading
-import time
-import sys
+import socket, json, threading, sys, time, random, uuid
 from Modules import protocol
-from Modules.peer_manager import PeerManager
-from Modules.identity_manager import IdentityManager
+from Modules.local_db import LocalDB
 
-class LANChatApp:
-    def __init__(self, username): # We no longer need the user to input a port!
-        self.username = username
+class LANClientApp:
+    def __init__(self, host_ip, host_port=5000):
+        self.host_ip = host_ip
+        self.host_port = host_port
+        self.username = None
+        self.roster = {}
         self.running = True
         
-        # 1. Load identity
-        self.identity = IdentityManager()
-        self.node_id = self.identity.node_id
-        self.pub_key_pem = self.identity.get_public_key_bytes().decode('utf-8')
-        
-        # 2. Setup the Server Component FIRST and Auto-Assign Port
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Port 0 tells the Operating System to find and assign any free port
-        self.server_socket.bind(('0.0.0.0', 0)) 
-        self.server_socket.listen()
-        
-        # Retrieve the specific port the OS just gave us
-        self.port = self.server_socket.getsockname()[1] 
-        print(f"[System] Operating System assigned Port: {self.port}")
-        
-        # 3. Pass the assigned port to the LAN Discovery module
-        self.peer_manager = PeerManager(self.username, self.port, self.node_id, self.pub_key_pem)
+        self.simulate_drop = False  # Toggle for testing network chaos
 
-    # ==========================================
-    # SERVER COMPONENT: Receiving Messages
-    # ==========================================
-    def start_listening(self):
-        """Runs on a background thread to accept incoming connections."""
-        print(f"[Server] Listening for messages on port {self.port}...")
+        self.p2p_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.p2p_socket.bind(('0.0.0.0', 0))
+        self.p2p_socket.listen()
+        self.my_p2p_port = self.p2p_socket.getsockname()[1]
+        
+        self.host_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    def login(self, email, password):
+        """Connects to the Host and authenticates."""
+        try:
+            self.host_socket.connect((self.host_ip, self.host_port))
+            
+            login_payload = {
+                "email": email,
+                "passkey": password,
+                "listening_port": self.my_p2p_port  
+            }  
+            protocol.send_message(self.host_socket, protocol.TYPE_LOGIN, login_payload)
+            
+            packet_type, payload = protocol.receive_message(self.host_socket)
+            
+            if packet_type == protocol.TYPE_LOGIN_RESP and payload.get("status") == "success":
+                self.username = payload.get("username")
+                print(f"\n[System] Logged in successfully as '{self.username}'!")
+                
+                # Initialize SQLite Database for this user
+                self.db = LocalDB(self.username)
+                
+                # Start background workers
+                threading.Thread(target=self.listen_to_host, daemon=True).start()
+                threading.Thread(target=self.listen_for_p2p_chats, daemon=True).start()
+                
+                return True
+            else:
+                print(f"\n[Error] Login Failed: {payload.get('reason', 'Unknown')}")
+                return False
+                
+        except Exception as e:
+            print(f"[Error] Could not connect to Host at {self.host_ip}: {e}")
+            return False
+
+    def listen_to_host(self):
+        while self.running:
+            packet_type, payload = protocol.receive_message(self.host_socket)
+            if packet_type == protocol.TYPE_ROSTER_UPDATE:
+                self.roster = payload
+                for peer, info in payload.items():
+                    self.db.update_peer_cache(peer, info['ip'], info['port'])
+
+    def listen_for_p2p_chats(self):
         while self.running:
             try:
-                # Timeout allows the loop to check self.running periodically
-                self.server_socket.settimeout(1.0)
-                client_socket, addr = self.server_socket.accept()
+                self.p2p_socket.settimeout(1.0)
+                client_sock, addr = self.p2p_socket.accept()
                 
-                # Handle the incoming message in a new thread
-                threading.Thread(target=self.handle_incoming, args=(client_socket,), daemon=True).start()
+                try:
+                    packet_type, payload = protocol.receive_message(client_sock)
+                    
+                    if packet_type == protocol.TYPE_CHAT:
+                        # Optional: Chaos simulator test toggle
+                        if self.simulate_drop and random.random() < 0.5:
+                            client_sock.close()
+                            continue
+
+                        sender = payload.get("sender", "Unknown")
+                        content = payload.get("content", "")
+                        msg_id = payload.get("msg_id")
+                        seq_num = payload.get("seq_num")
+                        timestamp = payload.get("timestamp")
+                        
+                        # Send ACK immediately
+                        ack_payload = {"msg_id": msg_id, "status": "delivered"}
+                        protocol.send_message(client_sock, protocol.TYPE_ACK, ack_payload)
+                        client_sock.close()
+
+                        # Crash-safe atomic insert & sequence validation
+                        is_in_order = self.db.save_incoming_message(
+                            sender, msg_id, seq_num, content, timestamp
+                        )
+                        
+                        if is_in_order:
+                            print(f"\n[Incoming] {sender}: {content}\n> ", end="")
+                        
+                    else:
+                        client_sock.close()
+                        
+                except Exception:
+                    client_sock.close()
+                    
             except socket.timeout:
                 continue
-            except Exception as e:
-                if self.running: print(f"[Error] Listener crashed: {e}")
-                break
+            except Exception:
+                pass
 
-    # ==========================================
-    # SERVER COMPONENT (Explicit Rejection/Success)
-    # ==========================================
-    def handle_incoming(self, client_socket):
-        authenticated = False
-        peer_username = None
-        current_challenge = None
-        session_key = None  
-        
-        while self.running:
-            packet_type, payload = protocol.receive_message(client_socket)
-            if packet_type is None: break
-                
-            if not authenticated:
-                if packet_type == protocol.TYPE_AUTH_INIT:
-                    peer_username = payload.get("username")
-                    current_challenge = os.urandom(16).hex()
-                    protocol.send_message(client_socket, protocol.TYPE_AUTH_CHALLENGE, {"nonce": current_challenge})
-                
-                elif packet_type == protocol.TYPE_AUTH_RESPONSE:
-                    claimed_node_id = payload.get("node_id")
-                    pub_key = payload.get("pub_key")
-                    signature = payload.get("signature")
-                    enc_session_key = payload.get("session_key")
-                    
-                    if not IdentityManager.verify_node_id(pub_key, claimed_node_id):
-                        protocol.send_message(client_socket, protocol.TYPE_AUTH_ERROR, {"reason": "Fake Node ID"})
-                        break
-                        
-                    if not IdentityManager.verify_signature(pub_key, current_challenge, signature):
-                        protocol.send_message(client_socket, protocol.TYPE_AUTH_ERROR, {"reason": "Invalid Signature"})
-                        break
-                    
-                    try:
-                        session_key = self.identity.decrypt_session_key(enc_session_key)
-                    except Exception:
-                        protocol.send_message(client_socket, protocol.TYPE_AUTH_ERROR, {"reason": "Failed to decrypt session key"})
-                        break
-
-                    # Success! Save peer and notify the client they are cleared to send data.
-                    self.peer_manager._save_known_peer(peer_username, claimed_node_id, pub_key)
-                    authenticated = True
-                    protocol.send_message(client_socket, protocol.TYPE_AUTH_SUCCESS, {})
-                    
-            else:
-                if packet_type == protocol.TYPE_CHAT:
-                    encrypted_data = payload.get("encrypted_data")
-                    try:
-                        chat_data = IdentityManager.decrypt_payload(session_key, encrypted_data)
-                        content = chat_data.get("content", "")
-                        print(f"\n[Incoming] {peer_username}: {content}\n> ", end="")
-                    except Exception as e:
-                        print(f"\n[SECURITY] Message decryption failed: {e}\n> ", end="")
-                        
-        client_socket.close()
-
-    # ==========================================
-    # CLIENT COMPONENT (Encryption)
-    # ==========================================
-    def send_message(self, target_username, content):
-        peers = self.peer_manager.get_peer_list()
-        if target_username not in peers:
+    def send_p2p_message(self, target_username, content):
+        if target_username not in self.roster:
             print(f"[Error] {target_username} is not online.")
             return
 
-        target_ip = peers[target_username]['ip']
-        target_port = peers[target_username]['port']
-        target_pub_key = peers[target_username]['pub_key'] # Needed to encrypt the session key
+        if target_username == self.username:
+            print("[Error] You cannot message yourself.")
+            return
 
-        try:
-            out_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            out_socket.settimeout(5.0)
-            out_socket.connect((target_ip, target_port))
-            
-            # STEP 1 & 2: Handshake Init & Challenge
-            protocol.send_message(out_socket, protocol.TYPE_AUTH_INIT, {"username": self.username})
-            packet_type, payload = protocol.receive_message(out_socket)
-            if packet_type != protocol.TYPE_AUTH_CHALLENGE:
-                raise Exception("Server refused authentication.")
-            
-            # STEP 3: Generate Session Key, Encrypt it, and Sign Response
-            nonce = payload.get("nonce")
-            signature = self.identity.sign_challenge(nonce)
-            session_key = IdentityManager.generate_session_key()
-            enc_session_key = self.identity.encrypt_session_key(target_pub_key, session_key)
-            
-            auth_response = {
-                "node_id": self.node_id,
-                "pub_key": self.pub_key_pem,
-                "signature": signature,
-                "session_key": enc_session_key 
-            }
-            protocol.send_message(out_socket, protocol.TYPE_AUTH_RESPONSE, auth_response)
-            
-            # Wait for Server Verification
-            packet_type, payload = protocol.receive_message(out_socket)
-            if packet_type == protocol.TYPE_AUTH_ERROR:
-                raise Exception(f"Server rejected authentication: {payload.get('reason')}")
-            elif packet_type != protocol.TYPE_AUTH_SUCCESS:
-                raise Exception("Unexpected response during authentication.")
-            
-            # Authorized! Encrypt and send the chat payload
-            chat_payload = {
-                "content": content,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            encrypted_b64 = IdentityManager.encrypt_payload(session_key, chat_payload)
-            protocol.send_message(out_socket, protocol.TYPE_CHAT, {"encrypted_data": encrypted_b64})
-            
-            out_socket.close()
-            print(f"[Sent to {target_username}]")
-            
-        except Exception as e:
-            print(f"[Error] Connection failed: {e}")
-
-    # ==========================================
-    # APPLICATION UI / MAIN LOOP
-    # ==========================================
-    def run(self):
-        # Start the listener server in the background
-        threading.Thread(target=self.start_listening, daemon=True).start()
+        msg_id = uuid.uuid4().hex  
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         
+        chat_payload = {
+            "msg_id": msg_id,      
+            "sender": self.username,
+            "content": content,
+            "timestamp": timestamp
+        }
+        
+        # Execute crash-safe transaction
+        self.db.save_outgoing_message(
+            target_username, msg_id, content, timestamp, chat_payload
+        )
+        
+        # Dispatch background retry thread
+        threading.Thread(target=self._send_with_retry, args=(target_username, chat_payload), daemon=True).start()
+
+    def _send_with_retry(self, target_username, chat_payload, max_retries=3):
+        msg_id = chat_payload["msg_id"]
+        
+        for attempt in range(1, max_retries + 1):
+            target_info = self.roster.get(target_username)
+            if not target_info: 
+                return 
+                
+            try:
+                out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                out_sock.settimeout(2.0) 
+                out_sock.connect((target_info["ip"], target_info["port"]))
+                
+                protocol.send_message(out_sock, protocol.TYPE_CHAT, chat_payload)
+                ack_type, ack_payload = protocol.receive_message(out_sock)
+                
+                if ack_type == protocol.TYPE_ACK and ack_payload.get("msg_id") == msg_id:
+                    self.db.update_message_status(msg_id, "DELIVERED")
+                    self.db.remove_from_outbox(msg_id)
+                    
+                    if attempt == 1:
+                        print(f"\n[Sent to {target_username}] (✓ Delivered)\n> ", end="")
+                    else:
+                        print(f"\n[Sent to {target_username}] (✓ Delivered on retry {attempt})\n> ", end="")
+                    out_sock.close()
+                    return 
+                    
+                out_sock.close()
+            except Exception:
+                pass 
+                
+            time.sleep(1.0) 
+            
+        # Update database status to FAILED after all retries are exhausted
+        self.db.update_message_status(msg_id, "FAILED")
+        print(f"\n[Error] Failed to deliver message to {target_username}. Stored in Outbox.\n> ", end="")
+
+    def run(self):
         print("\n--- LAN Chat Ready ---")
-        print("Commands: '/peers' to see online users, '/quit' to exit.")
+        print("Commands: '/peers' online users, '/status' message history, '/quit' to exit.")
         print("To message someone, type: @username Hello there!")
         
         while self.running:
             try:
                 user_input = input("> ").strip()
-                
                 if user_input.lower() == '/quit':
                     self.shutdown()
+
                 elif user_input.lower() == '/peers':
-                    self.show_peers()
-                elif user_input.startswith('/forget '):
-                    target = user_input.split(' ', 1)[1]
-                    if self.peer_manager.forget_peer(target):
-                        print(f"Forgot identity for {target}. Their new key will be accepted on next discovery.")
+                    print(f"\n--- Online Peers ({len(self.roster)}) ---")
+                    for name in self.roster:
+                        print(f" - {name}")
+                    print("------------------------\n")
+
+                elif user_input.startswith('@'):
+                    parts = user_input.split(' ', 1)
+                    if len(parts) >= 2:
+                        target = parts[0][1:]
+                        self.send_p2p_message(target, parts[1])
                     else:
-                        print(f"No saved identity found for {target}.")
-                elif user_input:
-                    print("Please specify a user with @username")
+                        print("Invalid format. Use: @username message")
+
+                elif user_input.lower() == '/status':
+                    print("\n--- Message Status (From Database) ---")
+                    with self.db.get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT receiver, status, content FROM messages WHERE direction='OUTGOING'")
+                        rows = cursor.fetchall()
+                        if not rows:
+                            print("No messages sent yet.")
+                        for row in rows:
+                            print(f"To: {row[0]} | Status: {row[1]} | Content: '{row[2]}'")
+                    print("--------------------------------------\n")
+
+                elif user_input.lower() == '/drop':
+                    self.simulate_drop = not self.simulate_drop
+                    state = "ON" if self.simulate_drop else "OFF"
+                    print(f"\n[System] Network Chaos Simulator is now {state}.\n")
+
             except KeyboardInterrupt:
                 self.shutdown()
 
-    def show_peers(self):
-        peers = self.peer_manager.get_peer_list()
-        print(f"\n--- Online Peers ({len(peers)}) ---")
-        for name, data in peers.items():
-            print(f" - {name} ({data['ip']}:{data['port']})")
-        print("------------------------\n")
-
     def shutdown(self):
-        print("\nShutting down...")
         self.running = False
-        self.peer_manager.stop()
-        self.server_socket.close()
+        self.host_socket.close()
+        self.p2p_socket.close()
         sys.exit(0)
 
 if __name__ == "__main__":
-    my_name = input("Enter your username: ").strip()
-    app = LANChatApp(my_name) # Port is now handled automatically
-    app.run()
+    host_ip = input("Enter Host IP (e.g. 127.0.0.1 for local testing): ").strip()
+    email = input("Email: ").strip()
+    passkey = input("Passkey: ").strip()
+    
+    app = LANClientApp(host_ip)
+    if app.login(email, passkey):
+        app.run()
