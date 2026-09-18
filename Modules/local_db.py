@@ -51,6 +51,23 @@ class LocalDB:
                     attempts INTEGER DEFAULT 0
                 )
             ''')
+
+            # --- NEW: File Transfer Tracking ---
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS file_transfers (
+                    transfer_id TEXT PRIMARY KEY,
+                    peer_username TEXT,
+                    direction TEXT,
+                    file_name TEXT,
+                    file_size INTEGER,
+                    total_chunks INTEGER,
+                    chunks_completed INTEGER DEFAULT 0,
+                    file_hash TEXT,
+                    status TEXT,
+                    file_path TEXT
+                )
+            ''')
+            
             conn.commit()
 
     # ==========================================
@@ -180,3 +197,42 @@ class LocalDB:
                 return True 
             
             return False
+
+    def get_outbox_messages(self, target_username):
+        """Fetches pending messages for a specific peer."""
+        with self.db_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT msg_id, payload FROM outbox WHERE target_username=?', (target_username,))
+            return cursor.fetchall()
+
+    # ==========================================
+    # FILE TRANSFER TRACKING
+    # ==========================================
+    def init_file_transfer(self, transfer_id, peer, direction, file_name, file_size, total_chunks, path, file_hash, status="PENDING"):
+        with self.db_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR IGNORE INTO file_transfers 
+                (transfer_id, peer_username, direction, file_name, file_size, total_chunks, file_hash, status, file_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (transfer_id, peer, direction, file_name, file_size, total_chunks, file_hash, status, path))
+            conn.commit()
+
+    def get_transfer_state(self, transfer_id):
+        """Fetches the current offset and status for resuming/pausing."""
+        with self.db_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT chunks_completed, status, file_path, file_hash, total_chunks FROM file_transfers WHERE transfer_id=?', (transfer_id,))
+            return cursor.fetchone()
+
+    def update_file_progress(self, transfer_id, chunk_index=None, status=None):
+        """Updates the chunks completed or the overall status."""
+        with self.db_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            if chunk_index is not None:
+                cursor.execute('UPDATE file_transfers SET chunks_completed = ? WHERE transfer_id = ?', 
+                               (chunk_index + 1, transfer_id))
+            if status is not None:
+                cursor.execute('UPDATE file_transfers SET status = ? WHERE transfer_id = ?', 
+                               (status, transfer_id))
+            conn.commit()

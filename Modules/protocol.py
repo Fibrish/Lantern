@@ -7,6 +7,16 @@ TYPE_LOGIN_RESP = 2      # Host -> Client: "Success/Fail + Your Username"
 TYPE_ROSTER_UPDATE = 3   # Host -> Client: "Here is the updated list of online users"
 TYPE_CHAT = 4            # Client -> Client: P2P Chat message
 TYPE_ACK = 5             # <-- NEW: Client -> Client: "I received your message"
+TYPE_SYNC_REQ = 10
+TYPE_SYNC_RESP = 11
+TYPE_PING = 12
+TYPE_PONG = 13
+
+# --- File Transfer Packets ---
+TYPE_FILE_REQ = 20      # Sender -> Receiver: "Can I send you a file? (Metadata)"
+TYPE_FILE_RESP = 21     # Receiver -> Sender: "Accept / Reject"
+TYPE_FILE_CHUNK = 22    # Sender -> Receiver: Raw file data chunk
+TYPE_FILE_ACK = 23      # Receiver -> Sender: "Chunk received"
 
 def send_message(sock, packet_type, payload):
     """Serializes and sends a packet with a strict 4-byte header."""

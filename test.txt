@@ -1,0 +1,9 @@
+Alice:
+127.0.0.1
+alice@lan
+Yolo
+
+Bob:
+127.0.0.1
+bob@lan
+bob

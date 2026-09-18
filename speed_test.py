@@ -150,41 +150,36 @@ class LANClientApp:
                         protocol.send_message(client_sock, protocol.TYPE_PONG, {"sender": self.username})
                         client_sock.close()
 
-                    # --- NEW: High-Speed File Request (Receiver Side) ---
+                    # --- NEW: File Request (Receiver Side) ---
                     elif packet_type == protocol.TYPE_FILE_REQ:
                         sender = payload.get("sender")
                         transfer_id = payload.get("transfer_id")
                         file_name = payload.get("file_name")
                         file_size = payload.get("file_size")
+                        total_chunks = payload.get("total_chunks")
                         file_hash = payload.get("file_hash")
 
+                        # Isolate downloads to prevent overwriting local files
                         download_dir = f"Downloads_{self.username}"
                         os.makedirs(download_dir, exist_ok=True)
                         file_path = os.path.join(download_dir, file_name)
 
+                        print(f"\n[Incoming File] {sender} is sending '{file_name}' ({file_size} bytes). Saving to {download_dir}...\n> ", end="")
+
                         self.db.init_file_transfer(
                             transfer_id, sender, "INCOMING", file_name,
-                            file_size, 1, file_path, file_hash, "IN_PROGRESS" # total_chunks is just 1 now
+                            file_size, total_chunks, file_path, file_hash, "IN_PROGRESS"
                         )
-                        
-                        # 1. Create a temporary binary listening socket
-                        stream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        stream_sock.bind(('0.0.0.0', 0)) # OS assigns a random open port
-                        stream_sock.listen(1)
-                        binary_port = stream_sock.getsockname()[1]
 
-                        print(f"\n[Incoming File] {sender} sending '{file_name}' ({file_size} bytes). Opening binary port {binary_port}...\n> ", end="")
+                        # Create an empty file so the chunk writer can safely use seek() later
+                        open(file_path, 'wb').close()
 
-                        # 2. Automatically accept and tell the sender where to stream
+                        # Automatically accept the transfer
                         protocol.send_message(client_sock, protocol.TYPE_FILE_RESP, {
                             "transfer_id": transfer_id,
-                            "status": "ACCEPTED",
-                            "stream_port": binary_port
+                            "status": "ACCEPTED"
                         })
                         client_sock.close()
-                        
-                        # 3. Spin up the background thread to catch the incoming flood of data
-                        threading.Thread(target=self.receive_binary_stream, args=(stream_sock, file_path, file_size, file_hash, transfer_id), daemon=True).start()
 
                     # --- NEW: File Response (Sender Side) ---
                     elif packet_type == protocol.TYPE_FILE_RESP:
@@ -218,7 +213,7 @@ class LANClientApp:
                         state = self.db.get_transfer_state(transfer_id)
                         if state:
                             _, _, filepath, expected_hash, total_chunks = state
-                            chunk_size = 32768
+                            chunk_size = 1048576 * 2
                             
                             # r+b mode allows writing to specific byte offsets without overwriting the whole file
                             with open(filepath, 'r+b') as f:
@@ -738,14 +733,11 @@ class LANClientApp:
             resp_type, resp_payload = protocol.receive_message(sock)
             sock.close()
 
-            # If accepted, launch the binary streaming thread
+            # If accepted, launch the chunk transmission thread immediately
             if resp_type == protocol.TYPE_FILE_RESP and resp_payload.get("status") == "ACCEPTED":
-                stream_port = resp_payload.get("stream_port")
-                print(f"\n[System] File accepted! Streaming raw binary to port {stream_port}...\n> ", end="")
+                print(f"\n[System] File request accepted! Starting transmission...\n> ", end="")
                 self.db.update_file_progress(transfer_id, status="IN_PROGRESS")
-                
-                # Launch the high-speed worker
-                threading.Thread(target=self.transmit_binary_worker, args=(target_info["ip"], stream_port, filepath, transfer_id), daemon=True).start()
+                threading.Thread(target=self.transmit_file_worker, args=(target_username, transfer_id), daemon=True).start()
             else:
                 self.db.update_file_progress(transfer_id, status="REJECTED")
                 print(f"\n[Error] File transfer was rejected or timed out.\n> ", end="")
@@ -754,63 +746,64 @@ class LANClientApp:
             self.db.update_file_progress(transfer_id, status="FAILED")
             print(f"\n[Error] Failed to reach {target_username} for file transfer.\n> ", end="")
 
-    def transmit_binary_worker(self, target_ip, stream_port, filepath, transfer_id):
-        """Blasts the file over a dedicated TCP stream using OS-level zero-copy."""
+    def transmit_file_worker(self, target_username, transfer_id):
+        """Streams the file chunks, supporting Seek() and Pause/Resume."""
+        target_info = self.roster.get(target_username)
+        if not target_info:
+            return
+
+        state = self.db.get_transfer_state(transfer_id)
+        if not state: return
+        
+        start_chunk, status, filepath, _, total_chunks = state
+        chunk_size = 1048576 * 2
+        file_name = os.path.basename(filepath)
+
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((target_ip, stream_port))
-            
-            file_size = os.path.getsize(filepath)
-            
             with open(filepath, 'rb') as f:
-                # sendfile() handles the entire file transfer in C at the OS level
-                # It is the absolute fastest way to push a file to a network card in Python.
-                sock.sendfile(f)
+                # Exact byte offset calculation for resuming
+                byte_offset = start_chunk * chunk_size
+                f.seek(byte_offset)
                 
-            sock.close()
-            self.db.update_file_progress(transfer_id, status="COMPLETED")
-            print(f"\n[System] High-speed binary upload complete!\n> ", end="")
-            
-        except Exception as e:
-            self.db.update_file_progress(transfer_id, status="FAILED")
-            print(f"\n[Error] Binary upload failed: {e}\n> ", end="")
-
-    def receive_binary_stream(self, stream_sock, filepath, file_size, expected_hash, transfer_id):
-        """Catches the raw binary stream and writes directly to disk."""
-        stream_sock.settimeout(10.0)
-        try:
-            conn, addr = stream_sock.accept()
-            print(f"\n[System] Binary data channel opened with {addr}. Receiving...\n> ", end="")
-            
-            received_bytes = 0
-            
-            # wb mode: open for raw binary writing
-            with open(filepath, 'wb') as f:
-                while received_bytes < file_size:
-                    # Grab up to 64 KB at a time directly from the TCP buffer
-                    chunk = conn.recv(min(65536, file_size - received_bytes))
-                    if not chunk:
-                        break # Socket closed unexpectedly
+                for chunk_idx in range(start_chunk, total_chunks):
+                    # Check DB to see if user paused the transfer
+                    current_status = self.db.get_transfer_state(transfer_id)[1]
+                    if current_status == "PAUSED":
+                        print(f"\n[System] Transfer paused at {(chunk_idx/total_chunks)*100:.1f}%\n> ", end="")
+                        return
                         
-                    f.write(chunk)
-                    received_bytes += len(chunk)
+                    raw_bytes = f.read(chunk_size)
+                    encoded_data = base64.b64encode(raw_bytes).decode('utf-8')
+                    
+                    payload = {
+                        "transfer_id": transfer_id,
+                        "chunk_index": chunk_idx,
+                        "data": encoded_data
+                    }
+                    
+                    # --- FIX: Open and close socket PER CHUNK ---
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(5.0)
+                    sock.connect((target_info["ip"], int(target_info["port"])))
+                    
+                    protocol.send_message(sock, protocol.TYPE_FILE_CHUNK, payload)
+                    ack_type, ack_payload = protocol.receive_message(sock)
+                    sock.close()
+                    
+                    if ack_type == protocol.TYPE_FILE_ACK:
+                        self.db.update_file_progress(transfer_id, chunk_index=chunk_idx)
+                    else:
+                        raise ConnectionError("Invalid ACK received")
+                        
+                # Transmission Complete
+                self.db.update_file_progress(transfer_id, status="COMPLETED")
+                print(f"\n[System] File {filepath} successfully sent to {target_username}! (100%)\n> ", end="")
             
-            conn.close()
-            stream_sock.close()
-            
-            if received_bytes == file_size:
-                final_hash = self.get_file_hash(filepath)
-                if final_hash == expected_hash:
-                    self.db.update_file_progress(transfer_id, status="COMPLETED")
-                    print(f"\n[System] File transfer COMPLETE and verified! Saved to {filepath}\n> ", end="")
-                else:
-                    print(f"\n[Error] File received but SHA-256 hash MISMATCH.\n> ", end="")
-            else:
-                print(f"\n[Error] Transfer dropped prematurely. Received {received_bytes}/{file_size} bytes.\n> ", end="")
-                
         except Exception as e:
-            print(f"\n[Error] Binary transfer failed: {e}\n> ", end="")
-
+            # Drop connection and save exact progress for auto-resume
+            self.db.update_file_progress(transfer_id, status="INTERRUPTED")
+            print(f"\n[Warning] Transfer interrupted. Progress saved for recovery.\n> ", end="")
+            
 if __name__ == "__main__":
     host_ip = input("Enter Host IP (e.g. 127.0.0.1 for local testing): ").strip()
     email = input("Email: ").strip()
